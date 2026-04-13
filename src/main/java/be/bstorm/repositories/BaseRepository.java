@@ -18,10 +18,13 @@ import static be.bstorm.utils.ConnectionUtils.getConnection;
  *
  * <hr>
  * <h2>Concept : Classe abstraite générique</h2>
- * <p>Cette classe est {@code abstract} car elle ne peut pas être utilisée directement :
- * elle ne sait pas comment transformer une ligne SQL ({@link ResultSet}) en objet Java.
- * Chaque sous-classe concrète doit implémenter {@link #buildEntity(ResultSet)} pour
- * définir ce mapping.
+ * <p>Cette classe est {@code abstract} pour empêcher toute instanciation directe :
+ * elle doit toujours être sous-classée avec les paramètres de type concrets,
+ * ce qui est nécessaire pour que la réflexion puisse résoudre {@code TEntity} à l'exécution.
+ *
+ * <p>La méthode {@link #buildEntity(ResultSet)} possède une implémentation par défaut
+ * entièrement pilotée par la réflexion (constructeur vide + {@code rs.getObject}).
+ * Les sous-classes peuvent la surcharger si un mapping personnalisé est nécessaire.
  *
  * <p>{@code <TEntity, TId>} sont des <b>paramètres de type</b> (génériques) :
  * <ul>
@@ -529,38 +532,52 @@ public abstract class BaseRepository<TEntity, TId> {
     }
 
     // =========================================================================
-    // Méthode abstraite à implémenter dans chaque repository concret
+    // Méthode de mapping ResultSet → TEntity (surchargeable dans les sous-classes)
     // =========================================================================
 
     /**
      * Transforme la ligne courante du {@link ResultSet} en une instance de l'entité.
      *
-     * <p><b>Pourquoi cette méthode est-elle abstraite ?</b><br>
-     * {@code BaseRepository} sait <em>quand</em> appeler cette méthode (après chaque
-     * {@code rs.next()}), mais il ne sait pas <em>comment</em> lire les colonnes
-     * et construire l'objet — car cela dépend de chaque entité spécifique.
-     * C'est le <em>pattern Template Method</em> : la classe de base définit l'algorithme
-     * global, les sous-classes fournissent les étapes spécifiques.
+     * <p><b>Implémentation par défaut (réflexion) :</b><br>
+     * Cette méthode instancie {@code TEntity} via son constructeur sans argument,
+     * puis remplit chaque champ mappé en lisant la colonne correspondante dans le
+     * {@link ResultSet} avec {@code rs.getObject(colName, fieldType)}.
+     * Les champs annotés {@link NavigationProperty} sont ignorés (ils n'ont pas de colonne en DB).
      *
-     * <p><b>Exemple d'implémentation dans AuthorRepository :</b>
-     * <pre>
-     * {@code
-     * @Override
-     * protected Author buildEntity(ResultSet rs) throws SQLException {
-     *     return new Author(
-     *         rs.getInt("id"),
-     *         rs.getString("firstName"),
-     *         rs.getString("lastName"),
-     *         rs.getDate("birthDate").toLocalDate()
-     *     );
-     * }
-     * }
-     * </pre>
+     * <p><b>Prérequis :</b>
+     * <ul>
+     *   <li>L'entité doit posséder un constructeur sans argument (public ou package-private).</li>
+     *   <li>Les colonnes DB doivent correspondre aux noms résolus par {@link Column} ou au nom du champ.</li>
+     *   <li>Le driver JDBC doit supporter {@code getObject(label, Class)} pour les types utilisés
+     *       (ex: {@link java.time.LocalDate} nécessite JDBC 4.2+, supporté par PostgreSQL 42.x).</li>
+     * </ul>
+     *
+     * <p><b>Surcharge possible :</b><br>
+     * Une sous-classe peut redéfinir cette méthode pour un mapping personnalisé
+     * (conversions spéciales, logique métier, etc.).
      *
      * @param rs le {@link ResultSet} positionné sur la ligne courante (après {@code rs.next()})
      * @return une instance de {@code TEntity} construite depuis les données de la ligne
      * @throws SQLException si la lecture d'une colonne échoue
      */
-    protected abstract TEntity buildEntity(ResultSet rs) throws SQLException;
+    protected TEntity buildEntity(ResultSet rs) throws SQLException {
+        try {
+            // Instanciation via le constructeur sans argument
+            TEntity entity = entityClass.getDeclaredConstructor().newInstance();
+
+            // Remplissage de chaque champ mappé (hors @NavigationProperty)
+            for (Field field : getMappedFields()) {
+                String colName = resolveColumnName(field);
+                // getObject(label, Class) gère automatiquement les conversions de types
+                // (Integer, String, LocalDate, etc.) — JDBC 4.2+
+                Object value = rs.getObject(colName, field.getType());
+                field.set(entity, value);
+            }
+            return entity;
+        } catch (ReflectiveOperationException e) {
+            throw new RuntimeException(
+                    "buildEntity a échoué pour " + entityClass.getSimpleName(), e);
+        }
+    }
 }
 
